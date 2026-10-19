@@ -234,3 +234,17 @@ def test_pause_is_unsupported():
         adapter.pause()
     with pytest.raises(UnsupportedOperation):
         adapter.resume()
+
+
+def test_closed_client_and_non_json_responses_are_device_errors():
+    adapter = LgThinqAdapter(
+        LgThinqConfig(access_token="pat", country="GB", device_id="washer-1"),
+        client=httpx.Client(
+            transport=httpx.MockTransport(lambda request: httpx.Response(200, text="<html>"))
+        ),
+    )
+    with pytest.raises(DeviceError, match="not JSON"):
+        adapter.get_state()
+    adapter._client.close()
+    with pytest.raises(DeviceError, match="request failed"):
+        adapter.get_state()

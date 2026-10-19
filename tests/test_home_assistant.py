@@ -163,16 +163,56 @@ def test_status_map_override_and_unknown_states(caplog):
     assert custom.get_state().status is MachineStatus.RUNNING
 
 
-def test_lg_style_start_needs_explicit_opt_in():
+def test_lg_style_start_needs_explicit_opt_ins():
     hass = FakeHass(LG_STATES)
     with pytest.raises(UnsupportedOperation, match="start_preselected_program"):
         make_adapter(hass, **LG_CONFIG).start_cycle(COTTON)
-    adapter = make_adapter(hass, **LG_CONFIG, start_preselected_program=True)
+    preselected = make_adapter(hass, **LG_CONFIG, start_preselected_program=True)
+    assert not preselected.capabilities.remote_start
+    with pytest.raises(UnsupportedOperation, match="allow_uncontrolled_levels"):
+        preselected.start_cycle(COTTON)
+    assert hass.calls == []
+    adapter = make_adapter(
+        hass, **LG_CONFIG, start_preselected_program=True, allow_uncontrolled_levels=True
+    )
     assert adapter.capabilities.remote_start and not adapter.capabilities.select_program
     adapter.start_cycle(COTTON)
     assert hass.calls == [
         ("select.select_option", {"entity_id": "select.washer_operation", "option": "start"})
     ]
+
+
+def test_programme_choice_without_temperature_control_changes_nothing():
+    hass = FakeHass(HOME_CONNECT_STATES)
+    hass.set("select.washer_program", "laundry_care_washer_program_cotton")
+    config = {
+        **HOME_CONNECT_CONFIG,
+        "program_select_entity": "select.washer_program",
+        "start": {"service": "home_connect.start_selected_program", "data": {"device_id": "d"}},
+    }
+    adapter = make_adapter(hass, **config)
+    assert not adapter.capabilities.select_program
+    with pytest.raises(UnsupportedOperation, match="cannot set the temperature"):
+        adapter.start_cycle(COTTON)
+    assert hass.calls == []  # not even the programme select was touched
+
+
+def test_unmapped_programme_never_falls_back_to_the_preselected_one():
+    hass = FakeHass(HOME_CONNECT_STATES)
+    adapter = make_adapter(hass, **HOME_CONNECT_CONFIG, start_preselected_program=True)
+    with pytest.raises(UnsupportedOperation, match="'wool'"):
+        adapter.start_cycle(CycleSettings(program=Program.WOOL, temperature_c=30, spin_rpm=600))
+    assert hass.calls == []
+
+
+def test_non_json_success_response_is_a_device_error():
+    hass = FakeHass(HOME_CONNECT_STATES)
+    adapter = make_adapter(hass, **HOME_CONNECT_CONFIG)
+    adapter._client = httpx.Client(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, text="<html>"))
+    )
+    with pytest.raises(DeviceError, match="not JSON"):
+        adapter.get_state()
 
 
 def test_home_connect_style_one_shot_start_fills_placeholders():

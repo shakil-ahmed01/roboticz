@@ -30,6 +30,7 @@ ADAPTER_CONFIGS: dict[str, type[BaseModel]] = {
 }
 
 DEFAULT_CONFIG_FILE = "config.yaml"
+_PATH_FIELDS = frozenset({"ca_certs"})
 _ENV_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 
 
@@ -77,6 +78,8 @@ class MachineConfig(BaseModel):
     smartthings: dict[str, Any] = Field(default_factory=dict)
     home_assistant: dict[str, Any] = Field(default_factory=dict)
     lg_thinq: dict[str, Any] = Field(default_factory=dict)
+    config_dir: Path | None = Field(default=None, exclude=True)
+    """Directory of the config file; relative file paths in adapter settings are resolved here."""
 
     def adapter_config(self) -> BaseModel:
         """The validated connection settings of the selected adapter."""
@@ -84,9 +87,20 @@ class MachineConfig(BaseModel):
             return self.simulator
         raw = expand_env(getattr(self, self.adapter) or {}, f"machine.{self.adapter}")
         try:
-            return ADAPTER_CONFIGS[self.adapter].model_validate(raw)
+            config = ADAPTER_CONFIGS[self.adapter].model_validate(raw)
         except ValidationError as exc:
             raise ConfigError(f"machine.{self.adapter} is incomplete:\n{exc}") from exc
+        if self.config_dir is None:
+            return config
+        paths = {
+            name: str(self.config_dir / value)
+            for name, value in config.model_dump().items()
+            if (name.endswith("_path") or name in _PATH_FIELDS)
+            and isinstance(value, str)
+            and value
+            and not Path(value).is_absolute()
+        }
+        return config.model_copy(update=paths) if paths else config
 
 
 class ModelsConfig(BaseModel):
@@ -180,6 +194,7 @@ def load_settings(path: str | Path | None = None) -> Settings:
     except ValidationError as exc:
         raise ConfigError(f"{path} has invalid settings:\n{exc}") from exc
     base = path.resolve().parent
+    settings.machine.config_dir = base
     if not settings.models.dir.is_absolute():
         settings.models.dir = base / settings.models.dir
     if not settings.data_dir.is_absolute():

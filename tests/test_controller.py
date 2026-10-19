@@ -351,3 +351,29 @@ def test_webhook_receives_the_configured_events():
     assert received[0]["data"] == {"minutes": 120}
     assert [e["event"] for e in notifier.recent] == ["cycle_started", "cycle_finished"]
     notifier.close()
+
+
+class PreselectedOnlyAdapter(CloudLikeAdapter):
+    """Can press start but not choose anything, like LG's API."""
+
+    @property
+    def capabilities(self) -> AdapterCapabilities:
+        return AdapterCapabilities(select_program=False, pause_resume=False)
+
+
+def test_starting_without_programme_control_says_so_and_does_not_calibrate(models, tmp_path, clock):
+    adapter = PreselectedOnlyAdapter()
+    controller = make_controller(models, tmp_path, clock, adapter=adapter)
+    result = controller.start_cycle(StartCycleRequest(profile=COTTON))
+    assert result.applied is False
+    assert "runs whatever is set on it" in result.warnings[0]
+    assert (
+        controller.notifier.recent[-1]["message"] == "The programme set on the machine has started."
+    )
+    clock.now += 3600
+    controller.poll()
+    adapter.status = MachineStatus.FINISHED
+    controller.poll()
+    [cycle] = controller.history.recent()
+    assert cycle.settings is None
+    assert models.estimator.observations() == 0

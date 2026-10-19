@@ -16,12 +16,15 @@ drum-speed, vibration, current, temperature, water-level and power readings that
 API publishes. For fault detection, add sensors and use the MQTT adapter
 ([mqtt-protocol.md](mqtt-protocol.md)).
 
-**Fabric-care safety.** The adapters never run hotter or spin faster than the recommendation.
-Temperature and spin are rounded down to the nearest value the machine offers for the chosen
-programme. If the programme cannot go that low, the start is refused (`UnsupportedOperation`)
-before any command is sent. When a machine lacks a programme, the adapter falls back only to a
-programme with the same or gentler drum action; for example, mixed falls back to synthetics, but
-wool never falls back to anything.
+**Fabric-care safety.** The adapters never run hotter or spin faster than the recommendation:
+- **Rounding down:** temperature and spin are rounded down to the nearest value the machine offers
+  for the chosen programme.
+- **Refusing:** the start is refused (`UnsupportedOperation`) before any command is sent if the
+  programme cannot go that low. It is also refused if SmartWash can neither set nor read a value
+  the machine would otherwise choose by itself; a few clearly named settings opt in to that case.
+- **Fallbacks:** when a machine lacks a programme, the adapter falls back only to a programme with
+  the same or gentler drum action. For example, mixed falls back to synthetics, but wool never
+  falls back to anything.
 
 **Remote start must be enabled on the machine.** Every maker requires someone at the washer to
 allow remote start after loading it and closing the door. See each section below.
@@ -72,11 +75,19 @@ Uses the official [Home Connect API](https://api-docs.home-connect.com).
 `base_url: https://simulator.home-connect.com` and use the simulator token shown in the portal.
 
 **Limits.** The API allows 1000 requests per day, 50 per minute, and 5 programme starts and 5
-stops per minute. Ten consecutive failed requests block the client for 10 minutes. Each status
-refresh costs two requests, so the adapter caches the state for `min_poll_interval_s` (default
-60 s). The API has no prewash or extra-rinse option for washers; those settings are ignored with a
-warning. Programme keys are checked against `programs/available`, and allowed temperatures and
-spins come from each programme's constraints.
+stops per minute. Ten consecutive failed requests block the client for 10 minutes. To stay inside
+these limits the adapter:
+- reads the state at most every `min_poll_interval_s` (default 60 s) while a programme runs or was
+  just commanded, and every `idle_poll_interval_s` (default 300 s) otherwise;
+- backs off after failures, honouring `Retry-After`;
+- does not retry a rejected refresh token for an hour.
+
+Programme keys are checked against `programs/available`, and allowed temperatures and spins come
+from each programme's constraints. A programme with no temperature or spin setting is refused,
+because its fixed value cannot be checked. The exception is Eco 40-60, whose own temperature suits
+the 40-60 °C laundry it is designed for. Bedding falls back to Mix, because there is no bed-linen
+programme and Cotton would be harsher. The API has no prewash or extra-rinse option for washers;
+those settings are ignored with a warning.
 
 ## Samsung SmartThings
 
@@ -109,16 +120,24 @@ Uses the [SmartThings REST API](https://developer.smartthings.com/docs/api/publi
 
 4. Before starting remotely, turn on **Smart Control** on the washer.
 
-**How a start works.** The adapter sends the following, in order: `setWasherCycle`, the water
-temperature and spin level, one rinse more than the cycle default when an extra rinse is
-recommended, and then `setMachineState: run`. Temperatures and spins come from the chosen cycle's
-own option lists. Word levels (`cold`, `warm`, `high`, …) are treated as conservative upper bounds;
-for example, `high` counts as 1400 rpm.
+**How a start works.** The adapter sends these commands, in order:
+1. `setWasherCycle`;
+2. the water temperature and spin level;
+3. one rinse more than the cycle default, when an extra rinse is recommended.
 
-**Limits.** There is no prewash option. Some models accept the cycle command but silently ignore
-it, so watch the first run. Models that disable the standard `washerOperatingState` capability are
-driven through Samsung's `samsungce.washerOperatingState` commands on a best-effort basis. State is
-cached for `min_poll_interval_s` (default 10 s).
+SmartThings applies commands asynchronously, and some models accept them but silently ignore them.
+So the adapter then re-reads the washer until it reports a temperature and spin within the
+request, for up to `settle_timeout_s` (default 8 s). Only then does it send
+`setMachineState: run`; if the washer never confirms, the cycle is not started.
+
+Temperatures and spins come from the chosen cycle's own option lists. Word levels (`cold`, `warm`,
+`high`, …) are treated as conservative upper bounds; for example, `high` counts as 1400 rpm. A
+cycle whose temperature or spin can neither be set nor read is refused. Set
+`allow_unverified_levels: true` only after checking such cycles against your care labels.
+
+**Limits.** There is no prewash option. Models that disable the standard `washerOperatingState`
+capability are driven through Samsung's `samsungce.washerOperatingState` commands on a best-effort
+basis. State is cached for `min_poll_interval_s` (default 10 s).
 
 ## LG ThinQ (native)
 
@@ -171,6 +190,14 @@ placeholders: `{program}`, `{temperature}` and `{spin}`, filled with the integra
 values from `program_map`, `temperature_map` and `spin_map` or parsed from the selects' options,
 and `{temperature_c}` and `{spin_rpm}`, filled with plain numbers.
 
+Every option is worked out before anything on the washer changes. The start is refused when:
+- the temperature or spin cannot be set (no select entity and no placeholder), unless you set
+  `allow_uncontrolled_levels: true`;
+- the requested programme is not in `program_map` and has no gentler substitute there.
+
+`start_preselected_program: true` starts whatever is set on the washer, and only applies when no
+programme selection is configured at all.
+
 ### Example: LG ThinQ integration
 
 ```yaml
@@ -182,7 +209,8 @@ machine:
     status_entity: sensor.washer_current_status
     remaining_entity: sensor.washer_remaining_time
     remote_start_entity: binary_sensor.washer_remote_start
-    start_preselected_program: true      # LG cannot choose courses remotely
+    start_preselected_program: true      # LG cannot choose courses remotely...
+    allow_uncontrolled_levels: true      # ...nor temperature and spin: set them on the washer
     start:
       service: select.select_option
       data: {entity_id: select.washer_operation, option: start}
@@ -215,7 +243,7 @@ machine:
       delicates: laundry_care_washer_program_delicates_silk
       quick: laundry_care_washer_program_super_153045_super_1530
       sportswear: laundry_care_washer_program_sport_fitness
-      bedding: laundry_care_washer_program_cotton
+      # bedding is left out: it falls back to mix (cotton would be harsher than bedding)
       towels: laundry_care_washer_program_towels
       dark_wash: laundry_care_washer_program_dark_wash
       hygiene: laundry_care_washer_program_sensitive

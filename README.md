@@ -113,7 +113,7 @@ detection, add sensors and use the MQTT adapter.
 | Endpoint | What it does |
 |---|---|
 | `POST /recommend` | Load profile in, recommendation out (settings, estimate, reasons, alternatives) |
-| `POST /cycles` | Start a cycle: `{"profile": ...}` lets the AI choose; add `"settings"` to choose yourself (checked against the load's care limits and remembered as a preference) |
+| `POST /cycles` | Start a cycle: `{"profile": ...}` lets the AI choose; add `"settings"` to choose yourself (checked against the load's care limits and remembered as a preference). `applied: false` plus a warning means the connection can't choose settings, so the machine ran what was set on it |
 | `GET /cycles` | History of cycles: duration, energy, faults |
 | `GET /machine` | Live state, progress, remaining time, capabilities |
 | `POST /machine/pause` · `/resume` · `/stop` | Control the running cycle |
@@ -219,7 +219,8 @@ for features, training data, calibration and how to retrain on real data.
 
 - The guardrails cap temperature, spin and drum action for every cycle SmartWash starts.
 - The adapters round down to what your machine offers. They refuse to start when the machine can't
-  go low enough, and they only fall back to equal or gentler programmes.
+  go low enough, or when SmartWash can't set or check a value the machine would otherwise pick by
+  itself. They only fall back to equal or gentler programmes.
 - SmartWash's only automatic action is pausing a cycle on a critical fault. It never starts a cycle
   on its own.
 - Remote start must be enabled on the machine by someone standing at it, as manufacturers

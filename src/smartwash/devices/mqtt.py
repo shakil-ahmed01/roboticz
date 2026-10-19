@@ -180,6 +180,7 @@ class MqttWasherAdapter(WashingMachineAdapter):
         self._command_lock = threading.Lock()  # one command in flight at a time
         self._lock = threading.Lock()  # guards everything below; never held while waiting
         self._client: Any = None
+        self._closed = False
         self._link_up = False
         self._available: bool | None = None
         self._state: MachineState | None = None
@@ -201,6 +202,7 @@ class MqttWasherAdapter(WashingMachineAdapter):
         with self._connect_lock:
             if self._client is not None:
                 return
+            self._closed = False
             client = self._client_factory(cfg)
             client.on_connect = self._on_connect
             client.on_disconnect = self._on_disconnect
@@ -235,6 +237,7 @@ class MqttWasherAdapter(WashingMachineAdapter):
 
     def close(self) -> None:
         with self._connect_lock:
+            self._closed = True  # until connect() is called again explicitly
             with self._lock:
                 client, self._client = self._client, None
                 self._link_up = False
@@ -333,6 +336,8 @@ class MqttWasherAdapter(WashingMachineAdapter):
                         self._pending.pop(command_id, None)
 
     def _require_client(self) -> Any:
+        if self._closed:
+            raise DeviceError("the MQTT connection is closed")
         if self._client is None:
             self.connect()
         with self._lock:

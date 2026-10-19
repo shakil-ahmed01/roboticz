@@ -18,7 +18,8 @@ import logging
 import re
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any
 
@@ -188,7 +189,10 @@ class HomeAssistantConfig(BaseModel):
     prewash: ServiceCall | None = None
     extra_rinse: ServiceCall | None = None
     start_preselected_program: bool = False
-    """Allow starting whatever programme is selected on the washer when none can be chosen."""
+    """When no programme selection is configured, start whatever programme is set on the washer."""
+    allow_uncontrolled_levels: bool = False
+    """Start even when the temperature or spin cannot be set through Home Assistant, so the
+    washer's own setting applies. Only enable this if you always set them on the machine."""
     min_poll_interval_s: float = 0.0
     timeout_s: float = 15.0
     verify_ssl: bool = True
@@ -229,9 +233,12 @@ class HomeAssistantAdapter(WashingMachineAdapter):
     def capabilities(self) -> AdapterCapabilities:
         config = self.config
         chooses = self._chooses_program()
+        levels = self._controls("temperature") and self._controls("spin")
         return AdapterCapabilities(
-            remote_start=config.start is not None and (chooses or config.start_preselected_program),
-            select_program=chooses,
+            remote_start=config.start is not None
+            and (chooses or config.start_preselected_program)
+            and (levels or config.allow_uncontrolled_levels),
+            select_program=chooses and levels,
             pause_resume=config.pause is not None and config.resume is not None,
             stop=config.stop is not None,
             telemetry_fields=frozenset({"power_w"}) if config.power_entity else frozenset(),
@@ -240,7 +247,7 @@ class HomeAssistantAdapter(WashingMachineAdapter):
     # ----------------------------------------------------------------- lifecycle
 
     def connect(self) -> None:
-        with self._lock:
+        with self._lock, _unexpected_payloads():
             self._request("GET", "/api/")
             status = self._entity(self.config.status_entity, required=True)
             self._friendly_name = (status.get("attributes") or {}).get("friendly_name")
@@ -259,7 +266,7 @@ class HomeAssistantAdapter(WashingMachineAdapter):
 
     def list_devices(self) -> list[dict[str, Any]]:
         """Entities that look washer-related, to help fill in the configuration."""
-        with self._lock:
+        with self._lock, _unexpected_payloads():
             entities = self._request("GET", "/api/states") or []
         found = []
         for entity in entities:
@@ -279,7 +286,7 @@ class HomeAssistantAdapter(WashingMachineAdapter):
     # --------------------------------------------------------------------- state
 
     def get_state(self) -> MachineState:
-        with self._lock:
+        with self._lock, _unexpected_payloads():
             now = time.monotonic()
             if self._cached and now - self._cached[0] < self.config.min_poll_interval_s:
                 return self._cached[1]
@@ -332,7 +339,7 @@ class HomeAssistantAdapter(WashingMachineAdapter):
         """One power reading per call while running (phase falls back to ``wash`` if unknown)."""
         if not self.config.power_entity:
             return []
-        with self._lock:
+        with self._lock, _unexpected_payloads():
             state = self._last_state
             if state is None or state.status is not MachineStatus.RUNNING:
                 return []
@@ -352,7 +359,7 @@ class HomeAssistantAdapter(WashingMachineAdapter):
     # ------------------------------------------------------------------ commands
 
     def start_cycle(self, settings: CycleSettings, *, load_kg: float | None = None) -> None:
-        with self._lock:
+        with self._lock, _unexpected_payloads():
             config = self.config
             if config.start is None:
                 raise UnsupportedOperation("Configure home_assistant.start to start the washer")
@@ -370,22 +377,15 @@ class HomeAssistantAdapter(WashingMachineAdapter):
                 "temperature_c": settings.temperature_c,
                 "spin_rpm": settings.spin_rpm,
             }
+            program_option = None
             if self._chooses_program():
-                option = self._program_option(settings.program)
-                if option is not None:
-                    values["program"] = option
-                    if config.program_select_entity:
-                        self._select(config.program_select_entity, option)
-                elif config.start_preselected_program and not self._uses("{program}"):
-                    log.warning(
-                        "No program_map entry for %s; starting the selected programme",
-                        settings.program.value,
-                    )
-                else:
+                program_option = self._program_option(settings.program)
+                if program_option is None:
                     raise UnsupportedOperation(
-                        f"No program_map entry for '{settings.program.value}' or a substitute; "
-                        f"mapped: {', '.join(config.program_map) or 'none'}"
+                        f"No program_map entry for '{settings.program.value}' or a gentler "
+                        f"substitute; mapped: {', '.join(config.program_map) or 'none'}"
                     )
+                values["program"] = program_option
             elif not config.start_preselected_program:
                 raise UnsupportedOperation(
                     "No way to choose the programme is configured: set program_map plus "
@@ -393,24 +393,48 @@ class HomeAssistantAdapter(WashingMachineAdapter):
                     "start_preselected_program: true to start what is selected on the washer"
                 )
 
-            self._apply_level(
-                values,
-                "temperature",
-                config.temperature_select_entity,
-                config.temperature_map,
-                settings.temperature_c,
-                parse_temperature_label,
-                "°C",
-            )
-            self._apply_level(
-                values,
-                "spin",
-                config.spin_select_entity,
-                config.spin_map,
-                settings.spin_rpm,
-                parse_spin_label,
-                "rpm",
-            )
+            # Work out every option first, so nothing on the washer changes if one is refused.
+            selects: list[tuple[str, str]] = []
+            for kind, entity, mapping, requested, parse, unit in (
+                (
+                    "temperature",
+                    config.temperature_select_entity,
+                    config.temperature_map,
+                    settings.temperature_c,
+                    parse_temperature_label,
+                    "°C",
+                ),
+                (
+                    "spin",
+                    config.spin_select_entity,
+                    config.spin_map,
+                    settings.spin_rpm,
+                    parse_spin_label,
+                    "rpm",
+                ),
+            ):
+                if not self._controls(kind):
+                    if not config.allow_uncontrolled_levels:
+                        raise UnsupportedOperation(
+                            f"SmartWash cannot set the {kind} through Home Assistant, so it "
+                            f"cannot keep it at or below {requested} {unit}. Set "
+                            f"{kind}_select_entity or use {{{kind}}} or {_NUMBER[kind]} in the "
+                            "start service data; or set allow_uncontrolled_levels: true if you "
+                            "always set it on the washer yourself"
+                        )
+                    self._warn_once(kind, "The washer's own %s setting applies", kind)
+                    continue
+                if entity is None and not self._uses("{" + kind + "}"):
+                    continue  # only the plain-number placeholder is used
+                option = self._level_option(entity, mapping, requested, parse, unit, kind)
+                values[kind] = option
+                if entity:
+                    selects.append((entity, option))
+
+            if program_option is not None and config.program_select_entity:
+                self._select(config.program_select_entity, program_option)
+            for entity, option in selects:
+                self._select(entity, option)
 
             for wanted, call, label in (
                 (settings.prewash, config.prewash, "prewash"),
@@ -438,9 +462,18 @@ class HomeAssistantAdapter(WashingMachineAdapter):
     def _simple_call(self, call: ServiceCall | None, label: str) -> None:
         if call is None:
             raise UnsupportedOperation(f"Configure home_assistant.{label} to {label} the washer")
-        with self._lock:
+        with self._lock, _unexpected_payloads():
             self._call(call, {})
             self._cached = None
+
+    def _controls(self, kind: str) -> bool:
+        """Whether the temperature or spin can be set through Home Assistant."""
+        entity = (
+            self.config.temperature_select_entity
+            if kind == "temperature"
+            else self.config.spin_select_entity
+        )
+        return entity is not None or self._uses("{" + kind + "}") or self._uses(_NUMBER[kind])
 
     def _chooses_program(self) -> bool:
         has_target = self.config.program_select_entity is not None or self._uses("{program}")
@@ -461,24 +494,6 @@ class HomeAssistantAdapter(WashingMachineAdapter):
             if option is not None and mapped == option:
                 return Program(program)
         return None
-
-    def _apply_level(
-        self,
-        values: dict[str, Any],
-        kind: str,
-        entity: str | None,
-        mapping: dict[int, str],
-        requested: int,
-        parse: Callable[[str], int | None],
-        unit: str,
-    ) -> None:
-        """Choose the temperature/spin option not above ``requested`` and select it if needed."""
-        if entity is None and not self._uses("{" + kind + "}"):
-            return
-        option = self._level_option(entity, mapping, requested, parse, unit, kind)
-        values[kind] = option
-        if entity:
-            self._select(entity, option)
 
     def _level_option(
         self,
@@ -549,12 +564,19 @@ class HomeAssistantAdapter(WashingMachineAdapter):
                 headers={"Authorization": f"Bearer {self.config.token}"},
                 json=json,
             )
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, RuntimeError) as exc:  # RuntimeError: client closed
             raise DeviceError(f"Home Assistant request failed: {exc}") from exc
         if response.status_code == 404 and allow_404:
             return None
         if response.is_success:
-            return response.json() if response.content else None
+            if not response.content:
+                return None
+            try:
+                return response.json()
+            except ValueError as exc:
+                raise DeviceError(
+                    f"Home Assistant sent a response that is not JSON for {method} {path}"
+                ) from exc
         try:
             message = response.json().get("message")
         except (ValueError, AttributeError):
@@ -571,6 +593,20 @@ class HomeAssistantAdapter(WashingMachineAdapter):
         if key not in self._warned:
             self._warned.add(key)
             log.warning(message, *args)
+
+
+_NUMBER = {"temperature": "{temperature_c}", "spin": "{spin_rpm}"}
+
+
+@contextmanager
+def _unexpected_payloads() -> Iterator[None]:
+    """Report malformed API responses as a DeviceError instead of crashing the caller."""
+    try:
+        yield
+    except DeviceError:
+        raise
+    except (KeyError, TypeError, ValueError, AttributeError, IndexError) as exc:
+        raise DeviceError(f"Unexpected response from Home Assistant: {exc!r}") from exc
 
 
 def _fill(value: Any, values: dict[str, Any]) -> Any:

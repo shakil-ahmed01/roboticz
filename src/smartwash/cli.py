@@ -317,6 +317,8 @@ def cmd_start(args: argparse.Namespace, settings: Settings) -> int:
         print(format_recommendation(result.recommendation))
     for note in result.adjustments:
         print(f"Adjusted: {note}")
+    for warning in result.warnings:
+        print(f"Warning: {warning}")
     print(f"Started. The machine reports: {result.state.status.value}.")
     return 0
 

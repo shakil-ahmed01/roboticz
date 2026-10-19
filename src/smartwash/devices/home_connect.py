@@ -6,8 +6,10 @@ the developer simulator (virtual appliances, same API, needs a developer-portal 
 
 Rate limits per client and user account: 1000 requests a day, 50 a minute, 5 programme starts and
 5 stops a minute, 10 token refreshes a minute (100 a day), and 10 consecutive failed requests block
-the client for 10 minutes. ``get_state`` is therefore cached for ``min_poll_interval_s`` (two
-requests per refresh), which keeps a day of 1-minute polling during washes well inside the quota.
+the client for 10 minutes. So ``get_state`` reads the API at most every ``min_poll_interval_s``
+while a programme runs (or was just commanded) and every ``idle_poll_interval_s`` otherwise, which
+keeps a day of polling at roughly 300 + 120 per hour of washing requests. Failed requests back off
+(honouring ``Retry-After``), and a rejected refresh token is not retried for an hour.
 
 The API exposes no sensor telemetry, prewash or extra-rinse option for washers, so those are
 unavailable here.
@@ -20,6 +22,8 @@ import logging
 import os
 import threading
 import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -73,6 +77,13 @@ _OPERATION_STATUS = {
     _OP + "Aborting": MachineStatus.RUNNING,
 }
 _BUSY_STATES = {_OP + s for s in ("DelayedStart", "Run", "Pause", "ActionRequired", "Aborting")}
+_ACTIVE = frozenset({MachineStatus.RUNNING, MachineStatus.PAUSED, MachineStatus.DELAYED_START})
+COMMAND_SETTLE_S = 600.0
+"""After a command, poll at the fast rate for this long while the washer reacts."""
+MIN_BACKOFF_S = 15.0
+MAX_BACKOFF_S = 600.0
+AUTH_BACKOFF_S = 300.0
+REFRESH_BLOCK_S = 3600.0
 _DOOR_OPEN = "BSH.Common.EnumType.DoorState.Open"
 
 _P = "LaundryCare.Washer.Program."
@@ -89,7 +100,9 @@ PROGRAM_KEYS: dict[Program, tuple[str, ...]] = {
         _P + "Super153045.Super15",
     ),
     Program.SPORTSWEAR: (_P + "SportFitness",),
-    Program.BEDDING: (_P + "Cotton",),
+    # No bed-linen programme exists; Cotton would be harsher than Bedding, so the fallback chain
+    # picks Mix instead (choose Cotton explicitly for robust cotton sheets).
+    Program.BEDDING: (),
     Program.TOWELS: (_P + "Towels",),
     Program.DARK_WASH: (_P + "DarkWash",),
     Program.HYGIENE: (_P + "Sensitive",),
@@ -127,6 +140,9 @@ class HomeConnectConfig(BaseModel):
     token_cache_path: str | None = None
     """Where refreshed tokens are stored so they survive restarts."""
     min_poll_interval_s: float = 60.0
+    """Fastest polling, used while a programme runs or was just commanded."""
+    idle_poll_interval_s: float = 300.0
+    """Polling while the washer is idle, to stay within the 1000 requests/day quota."""
     timeout_s: float = 20.0
     language: str = "en-GB"
 
@@ -140,11 +156,18 @@ class HomeConnectConfig(BaseModel):
 class HomeConnectAdapter(WashingMachineAdapter):
     name = "home_connect"
 
-    def __init__(self, config: HomeConnectConfig, *, client: httpx.Client | None = None) -> None:
+    def __init__(
+        self,
+        config: HomeConnectConfig,
+        *,
+        client: httpx.Client | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.config = config
         self._base = config.base_url.rstrip("/")
         self._client = client or httpx.Client(timeout=config.timeout_s)
         self._owns_client = client is None
+        self._clock = clock
         self._lock = threading.RLock()
         self._access_token = config.access_token
         self._refresh_token = config.refresh_token
@@ -152,6 +175,11 @@ class HomeConnectAdapter(WashingMachineAdapter):
         self._ha_id = config.ha_id
         self._appliance: dict[str, Any] = {}
         self._cached: tuple[float, MachineState] | None = None
+        self._busy_until = 0.0
+        self._failure: DeviceError | None = None
+        self._backoff_s = 0.0
+        self._retry_at = 0.0
+        self._refresh_blocked_until = 0.0
 
     @property
     def capabilities(self) -> AdapterCapabilities:
@@ -160,7 +188,7 @@ class HomeConnectAdapter(WashingMachineAdapter):
     # ----------------------------------------------------------------- lifecycle
 
     def connect(self) -> None:
-        with self._lock:
+        with self._lock, _unexpected_payloads():
             if self._access_token is None:
                 self._refresh()
             if self._ha_id:
@@ -190,16 +218,21 @@ class HomeConnectAdapter(WashingMachineAdapter):
         return {"adapter": self.name, **_describe_appliance(self._appliance)}
 
     def list_devices(self) -> list[dict[str, Any]]:
-        with self._lock:
+        with self._lock, _unexpected_payloads():
             return [_describe_appliance(a) for a in self._washers()]
 
     # --------------------------------------------------------------------- state
 
     def get_state(self) -> MachineState:
-        with self._lock:
-            now = time.monotonic()
-            if self._cached and now - self._cached[0] < self.config.min_poll_interval_s:
-                return self._cached[1]
+        with self._lock, _unexpected_payloads():
+            now = self._clock()
+            if self._cached:
+                busy = self._cached[1].status in _ACTIVE or now < self._busy_until
+                interval = (
+                    self.config.min_poll_interval_s if busy else self.config.idle_poll_interval_s
+                )
+                if now - self._cached[0] < interval:
+                    return self._cached[1]
             state = self._read_state()
             self._cached = (now, state)
             return state
@@ -252,7 +285,7 @@ class HomeConnectAdapter(WashingMachineAdapter):
     # ------------------------------------------------------------------ commands
 
     def start_cycle(self, settings: CycleSettings, *, load_kg: float | None = None) -> None:
-        with self._lock:
+        with self._lock, _unexpected_payloads():
             status = self._status()
             operation = status.get(OPERATION_STATE)
             if operation in _BUSY_STATES:
@@ -288,7 +321,7 @@ class HomeConnectAdapter(WashingMachineAdapter):
                 self._path("/programs/active"),
                 body={"data": {"key": key, "options": options}},
             )
-            self._cached = None
+            self._commanded()
             log.info("Started %s with %s", key, options)
 
     def pause(self) -> None:
@@ -298,18 +331,23 @@ class HomeConnectAdapter(WashingMachineAdapter):
         self._command(RESUME_COMMAND)
 
     def stop(self) -> None:
-        with self._lock:
+        with self._lock, _unexpected_payloads():
             self._request("DELETE", self._path("/programs/active"))
-            self._cached = None
+            self._commanded()
 
     # ------------------------------------------------------------------- helpers
 
     def _command(self, key: str) -> None:
-        with self._lock:
+        with self._lock, _unexpected_payloads():
             self._request(
                 "PUT", self._path(f"/commands/{key}"), body={"data": {"key": key, "value": True}}
             )
-            self._cached = None
+            self._commanded()
+
+    def _commanded(self) -> None:
+        """Re-read the state soon, and keep polling fast while the washer reacts."""
+        self._cached = None
+        self._busy_until = self._clock() + COMMAND_SETTLE_S
 
     def _choose_program(self, program: Program) -> str:
         programs = self._request("GET", self._path("/programs/available"))["data"]["programs"]
@@ -357,6 +395,7 @@ class HomeConnectAdapter(WashingMachineAdapter):
     def _request(
         self, method: str, path: str, *, body: Any = None, allow_404: bool = False
     ) -> dict[str, Any] | None:
+        self._check_backoff()
         if self._access_token is None:
             self._refresh()
         for attempt in range(2):
@@ -373,25 +412,61 @@ class HomeConnectAdapter(WashingMachineAdapter):
                 response = self._client.request(
                     method, f"{self._base}/api{path}", headers=headers, content=content
                 )
-            except httpx.HTTPError as exc:
-                raise DeviceError(f"Home Connect request failed: {exc}") from exc
+            except (httpx.HTTPError, RuntimeError) as exc:  # RuntimeError: client closed
+                raise self._failed(DeviceError(f"Home Connect request failed: {exc}")) from exc
             if response.status_code == 401 and attempt == 0 and self._can_refresh():
                 self._refresh()
                 continue
             break
         if response.status_code == 404 and allow_404:
+            self._succeeded()
             return None
         if response.is_success:
-            return response.json() if response.content else None
-        raise _error(response)
+            self._succeeded()
+            if not response.content:
+                return None
+            try:
+                return response.json()
+            except ValueError as exc:
+                raise DeviceError("Home Connect sent a response that is not JSON") from exc
+        error = _error(response)
+        if response.status_code in (401, 403, 429) or response.status_code >= 500:
+            raise self._failed(error, retry_after=_retry_after(response))
+        raise error
+
+    def _check_backoff(self) -> None:
+        if self._failure is None:
+            return
+        wait = self._retry_at - self._clock()
+        if wait > 0:
+            raise type(self._failure)(f"{self._failure} (retrying in {wait:.0f} s)")
+
+    def _failed(self, error: DeviceError, *, retry_after: float | None = None) -> DeviceError:
+        """Back off after a failure so polling cannot burn the quota or trigger a block."""
+        if retry_after is not None:
+            delay = retry_after
+        elif isinstance(error, DeviceAuthError):
+            delay = AUTH_BACKOFF_S
+        else:
+            delay = self._backoff_s = min(MAX_BACKOFF_S, max(MIN_BACKOFF_S, self._backoff_s * 2))
+        self._failure = error
+        self._retry_at = self._clock() + delay
+        return error
+
+    def _succeeded(self) -> None:
+        self._failure = None
+        self._backoff_s = 0.0
 
     def _can_refresh(self) -> bool:
-        return bool(self._refresh_token and self.config.client_secret)
+        return (
+            bool(self._refresh_token and self.config.client_secret)
+            and self._clock() >= self._refresh_blocked_until
+        )
 
     def _refresh(self) -> None:
         if not self._can_refresh():
             raise DeviceAuthError(
-                "Home Connect access token missing or expired and no refresh token set"
+                "Home Connect access token missing or expired, and no usable refresh token"
             )
         try:
             response = self._client.post(
@@ -402,12 +477,14 @@ class HomeConnectAdapter(WashingMachineAdapter):
                     "client_secret": self.config.client_secret,
                 },
             )
-        except httpx.HTTPError as exc:
-            raise DeviceError(f"Home Connect token refresh failed: {exc}") from exc
+        except (httpx.HTTPError, RuntimeError) as exc:
+            raise self._failed(DeviceError(f"Home Connect token refresh failed: {exc}")) from exc
         payload = _json(response)
         if not response.is_success or "access_token" not in payload:
             reason = payload.get("error_description") or payload.get("error") or response.text
-            raise DeviceAuthError(f"Home Connect token refresh failed: {reason}")
+            # Retrying a rejected refresh token only burns the 100 refreshes/day quota.
+            self._refresh_blocked_until = self._clock() + REFRESH_BLOCK_S
+            raise self._failed(DeviceAuthError(f"Home Connect token refresh failed: {reason}"))
         self._access_token = payload["access_token"]
         self._refresh_token = payload.get("refresh_token", self._refresh_token)
         self._save_cached_tokens()
@@ -432,9 +509,16 @@ class HomeConnectAdapter(WashingMachineAdapter):
         payload = json.dumps(
             {"access_token": self._access_token, "refresh_token": self._refresh_token}
         )
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as handle:
-            handle.write(payload)
+        target = Path(path)
+        tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as handle:
+                handle.write(payload)
+            os.replace(tmp, target)
+        except OSError as exc:  # the refreshed token still works for this run
+            log.warning("Could not save the refreshed Home Connect tokens to %s: %s", path, exc)
 
 
 def _describe_appliance(appliance: dict[str, Any]) -> dict[str, Any]:
@@ -470,10 +554,22 @@ def _option(
     requested: int,
     unit: str,
 ) -> dict[str, Any] | None:
-    """The option value closest to ``requested`` without exceeding it, or ``None`` to omit it."""
-    if definition is not None and option_key not in definition:
-        log.warning("%s has no %s option; the machine's default applies", program_key, option_key)
-        return None
+    """The option value closest to ``requested`` without exceeding it, or ``None`` to omit it.
+
+    An empty or unavailable definition tells us nothing, so the capped value is sent and the API
+    rejects it if the programme cannot take it. A programme that really has no such option runs at
+    a fixed value SmartWash cannot see, so it is refused: the one exception is Eco 40-60's own
+    temperature, which is designed for laundry rated 40-60 °C (the only loads the care rules allow
+    it for).
+    """
+    if definition and option_key not in definition:
+        if option_key == TEMPERATURE_OPTION and program_key in PROGRAM_KEYS[Program.ECO_40_60]:
+            return None
+        name = "temperature" if option_key == TEMPERATURE_OPTION else "spin speed"
+        raise UnsupportedOperation(
+            f"{program_key} has no {name} setting, so SmartWash cannot keep it at or below "
+            f"{requested} {unit}; choose another programme"
+        )
     everything, parse = _OPTION_VALUES[option_key]
     allowed = (definition or {}).get(option_key) or list(everything)
     value = choose_at_most(requested, allowed, parse)
@@ -483,6 +579,24 @@ def _option(
             f"{program_key} cannot run at or below {requested} {unit}; allowed: {names}"
         )
     return {"key": option_key, "value": value}
+
+
+def _retry_after(response: httpx.Response) -> float | None:
+    try:
+        return max(0.0, float(response.headers["Retry-After"]))
+    except (KeyError, ValueError):
+        return None
+
+
+@contextmanager
+def _unexpected_payloads() -> Iterator[None]:
+    """Report malformed API responses as a DeviceError instead of crashing the caller."""
+    try:
+        yield
+    except DeviceError:
+        raise
+    except (KeyError, TypeError, ValueError, AttributeError, IndexError) as exc:
+        raise DeviceError(f"Unexpected response from Home Connect: {exc!r}") from exc
 
 
 def _error(response: httpx.Response) -> DeviceError:

@@ -47,6 +47,21 @@ def test_environment_variables_fill_in_secrets(tmp_path, monkeypatch):
     assert settings.data_dir == tmp_path / "data"
 
 
+def test_relative_adapter_file_paths_are_resolved_against_the_config_file(tmp_path):
+    path = write(
+        tmp_path,
+        """
+        machine:
+          adapter: home_connect
+          home_connect:
+            access_token: t
+            token_cache_path: data/tokens.json
+        """,
+    )
+    config = load_settings(path).machine.adapter_config()
+    assert config.token_cache_path == str(tmp_path / "data" / "tokens.json")
+
+
 def test_missing_secret_for_the_selected_adapter_is_a_clear_error(tmp_path, monkeypatch):
     monkeypatch.delenv("ST_TOKEN", raising=False)
     path = write(

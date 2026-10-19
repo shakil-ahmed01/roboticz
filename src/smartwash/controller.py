@@ -71,8 +71,13 @@ class StartCycleRequest(BaseModel):
 
 class StartCycleResult(BaseModel):
     settings: CycleSettings
+    """The settings SmartWash chose; see ``applied`` for whether the machine could take them."""
+    applied: bool = True
+    """False when the connection cannot choose programme, temperature and spin, so the machine
+    ran whatever was set on it."""
     recommendation: Recommendation | None = None
     adjustments: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
     estimate: CycleEstimate
     state: MachineState
 
@@ -263,8 +268,18 @@ class WasherController:
             settings = request.settings
             if profile is not None and request.enforce_care_rules:
                 settings, adjustments = enforce_care_constraints(profile, settings)
-        if not self.adapter.capabilities.remote_start:
+        capabilities = self.adapter.capabilities
+        if not capabilities.remote_start:
             raise UnsupportedOperation(f"the {self.adapter.name} connection cannot start cycles")
+        applied = capabilities.select_program
+        warnings = []
+        if not applied:
+            warnings.append(
+                f"The {self.adapter.name} connection cannot choose the programme, temperature or "
+                "spin, so the machine runs whatever is set on it. Make sure that is no harsher "
+                f"than {settings.program.value} at {settings.temperature_c} °C and "
+                f"{settings.spin_rpm} rpm."
+            )
         load_kg = profile.weight_kg if profile else None
         estimate = (
             recommendation.estimate
@@ -278,9 +293,13 @@ class WasherController:
             if state.status is MachineStatus.OFFLINE:
                 raise DeviceNotReady("the machine is offline")
             self.adapter.start_cycle(settings, load_kg=load_kg)
+            # Settings the machine could not take must not calibrate the estimates later.
             self._begin_cycle(
                 CycleRecord(
-                    started_at=self._clock(), settings=settings, profile=profile, estimate=estimate
+                    started_at=self._clock(),
+                    settings=settings if applied else None,
+                    profile=profile,
+                    estimate=estimate if applied else None,
                 )
             )
             try:
@@ -293,17 +312,26 @@ class WasherController:
         if chose_own and settings != self.recommend(profile).settings:
             # Remember the household's preference; it personalises the next retraining.
             self.feedback.add(FeedbackRecord(profile=profile, settings=settings, source="override"))
+        if applied:
+            message = (
+                f"{settings.program.value.replace('_', ' ')} at {settings.temperature_c} °C, "
+                f"{settings.spin_rpm} rpm; about {estimate.duration_min:.0f} min."
+            )
+        else:
+            message = "The programme set on the machine has started."
         self.notifier.notify(
             "cycle_started",
             "Cycle started",
-            f"{settings.program.value.replace('_', ' ')} at {settings.temperature_c} °C, "
-            f"{settings.spin_rpm} rpm; about {estimate.duration_min:.0f} min.",
+            message,
             settings=settings.model_dump(mode="json"),
+            applied=applied,
         )
         return StartCycleResult(
             settings=settings,
+            applied=applied,
             recommendation=recommendation,
             adjustments=adjustments,
+            warnings=warnings,
             estimate=estimate,
             state=state,
         )

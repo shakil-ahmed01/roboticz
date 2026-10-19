@@ -1,3 +1,4 @@
+import copy
 import json
 
 import httpx
@@ -27,6 +28,9 @@ class FakeApi:
     def __init__(self) -> None:
         self.routes: dict[tuple[str, str], list] = {}
         self.requests: list[httpx.Request] = []
+        self.applies_commands = True
+        """Like the real cloud, later status reads reflect accepted level commands."""
+        self.applied: dict[tuple[str, str], str] = {}
 
     def on(self, method: str, path: str, *responses) -> None:
         self.routes[(method, path)] = list(responses)
@@ -37,8 +41,31 @@ class FakeApi:
         if not queue:
             return httpx.Response(404, json={"error": {"code": "NotFound", "message": "no route"}})
         item = queue.pop(0) if len(queue) > 1 else queue[0]
-        status, body = item(request) if callable(item) else item
+        result = item(request) if callable(item) else item
+        if isinstance(result, httpx.Response):
+            return result
+        status, body = result
+        if request.method == "POST" and request.url.path == COMMANDS:
+            self._apply(json.loads(request.content)["commands"][0])
+        elif request.method == "GET" and request.url.path == STATUS and self.applied:
+            body = copy.deepcopy(body)
+            main = body["components"]["main"]
+            for (capability, attribute), value in self.applied.items():
+                if capability in main:
+                    main[capability][attribute] = {"value": value}
         return httpx.Response(status, json=body)
+
+    def _apply(self, command: dict) -> None:
+        attribute = {
+            "setWasherWaterTemperature": (
+                "custom.washerWaterTemperature",
+                "washerWaterTemperature",
+            ),
+            "setWasherSpinLevel": ("custom.washerSpinLevel", "washerSpinLevel"),
+            "setWasherCycle": ("samsungce.washerCycle", "washerCycle"),
+        }.get(command["command"])
+        if attribute and self.applies_commands:
+            self.applied[attribute] = command["arguments"][0]
 
     def commands(self) -> list[dict]:
         sent = [r for r in self.requests if r.method == "POST" and r.url.path == COMMANDS]
@@ -157,9 +184,26 @@ def api():
     return fake
 
 
+class Clock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
 def make_adapter(api, **overrides):
     config = SmartThingsConfig(**{"token": "pat-1", "min_poll_interval_s": 0, **overrides})
-    adapter = SmartThingsAdapter(config, client=httpx.Client(transport=httpx.MockTransport(api)))
+    clock = Clock()
+    adapter = SmartThingsAdapter(
+        config,
+        client=httpx.Client(transport=httpx.MockTransport(api)),
+        clock=clock,
+        sleep=clock.sleep,
+    )
     adapter.connect()
     return adapter
 
@@ -285,12 +329,61 @@ def test_cycle_that_only_runs_hotter_is_refused_before_any_command(api):
     assert api.commands() == []
 
 
-def test_fixed_temperature_cycle_keeps_the_machine_default(api):
-    make_adapter(api, cycle_map={"wool": "1C"}).start_cycle(
-        CycleSettings(program=Program.WOOL, temperature_c=30, spin_rpm=600)
-    )
+def test_cycle_with_an_unknown_fixed_temperature_is_refused_unless_allowed(api):
+    wool = CycleSettings(program=Program.WOOL, temperature_c=30, spin_rpm=600)
+    with pytest.raises(UnsupportedOperation, match="neither set nor read the water temperature"):
+        make_adapter(api, cycle_map={"wool": "1C"}).start_cycle(wool)
+    assert api.commands() == []
+    make_adapter(api, cycle_map={"wool": "1C"}, allow_unverified_levels=True).start_cycle(wool)
     commands = [c["command"] for c in api.commands()]
     assert commands == ["setWasherCycle", "setWasherSpinLevel", "setMachineState"]
+
+
+def test_cycle_with_a_known_fixed_temperature_within_the_request_starts(api):
+    fixed = cycle("3A", [], temperature_default="30")
+    api.on("GET", STATUS, (200, status(cycles=[fixed], current="Table_02_Course_3A")))
+    make_adapter(api, cycle_map={"wool": "3A"}).start_cycle(
+        CycleSettings(program=Program.WOOL, temperature_c=30, spin_rpm=600)
+    )
+    assert [c["command"] for c in api.commands()][-1] == "setMachineState"
+
+
+def test_washer_that_cannot_set_temperature_is_refused_when_the_cycle_runs_hotter(api):
+    # The capability is disabled, and the cycle's own default is 60 °C.
+    hot = cycle("1B", [], temperature_default="60")
+    api.on(
+        "GET",
+        STATUS,
+        (200, status(cycles=[hot], disabled=["custom.washerWaterTemperature"])),
+    )
+    with pytest.raises(UnsupportedOperation, match="always uses 60"):
+        make_adapter(api, cycle_map={"cotton": "1B"}).start_cycle(
+            CycleSettings(program=Program.COTTON, temperature_c=30, spin_rpm=800)
+        )
+    assert api.commands() == []
+
+
+def test_levels_the_washer_silently_ignores_stop_the_start(api):
+    api.applies_commands = False  # commands come back ACCEPTED but nothing changes
+    with pytest.raises(DeviceError, match="did not confirm its water temperature"):
+        make_adapter(api, cycle_map={"cotton": "1B"}).start_cycle(
+            CycleSettings(program=Program.COTTON, temperature_c=30, spin_rpm=800)
+        )
+    assert "setMachineState" not in [c["command"] for c in api.commands()]
+
+
+def test_programme_selection_needs_temperature_and_spin_control(api):
+    api.on("GET", STATUS, (200, status(disabled=["custom.washerSpinLevel"])))
+    adapter = make_adapter(api, cycle_map={"cotton": "1B"})
+    adapter.get_state()
+    assert adapter.capabilities.select_program is False
+
+
+def test_non_json_success_response_is_a_device_error(api):
+    adapter = make_adapter(api)
+    api.on("GET", STATUS, lambda request: httpx.Response(200, text="<html>login</html>"))
+    with pytest.raises(DeviceError, match="not JSON"):
+        adapter.get_state()
 
 
 def test_word_levels_are_mapped_conservatively(api):

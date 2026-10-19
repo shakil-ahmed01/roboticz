@@ -154,6 +154,27 @@ def make_adapter(fake: FakeClient, **config: Any) -> MqttWasherAdapter:
 # ------------------------------------------------------------------ unit tests
 
 
+def test_closed_adapter_does_not_silently_reconnect(fake: FakeClient) -> None:
+    created = []
+
+    def factory(_: Any) -> FakeClient:
+        created.append(fake)
+        return fake
+
+    adapter = MqttWasherAdapter(
+        MqttConfig(base_topic=BASE), client_factory=factory, initial_state_wait_s=0
+    )
+    adapter.connect()
+    adapter.close()
+    with pytest.raises(DeviceError, match="closed"):
+        adapter.get_state()
+    with pytest.raises(DeviceError, match="closed"):
+        adapter.read_telemetry()
+    assert len(created) == 1
+    adapter.connect()  # an explicit connect opens it again
+    assert len(created) == 2
+
+
 def test_connect_subscribes_to_device_topics(fake: FakeClient) -> None:
     make_adapter(fake)
     assert fake.address == ("localhost", 1883, 30)

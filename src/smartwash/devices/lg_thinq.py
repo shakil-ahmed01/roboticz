@@ -17,6 +17,8 @@ import logging
 import threading
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import httpx
@@ -139,7 +141,7 @@ class LgThinqAdapter(WashingMachineAdapter):
     # ----------------------------------------------------------------- lifecycle
 
     def connect(self) -> None:
-        with self._lock:
+        with self._lock, _unexpected_payloads():
             devices = self._request("GET", "devices") or []
             washers = [d for d in devices if _device_type(d) in WASHER_TYPES]
             if self._device_id:
@@ -180,14 +182,14 @@ class LgThinqAdapter(WashingMachineAdapter):
         }
 
     def list_devices(self) -> list[dict[str, Any]]:
-        with self._lock:
+        with self._lock, _unexpected_payloads():
             devices = self._request("GET", "devices") or []
         return [_describe(d) for d in devices if _device_type(d) in WASHER_TYPES]
 
     # --------------------------------------------------------------------- state
 
     def get_state(self) -> MachineState:
-        with self._lock:
+        with self._lock, _unexpected_payloads():
             now = time.monotonic()
             if self._cached and now - self._cached[0] < self.config.min_poll_interval_s:
                 return self._cached[1]
@@ -233,7 +235,7 @@ class LgThinqAdapter(WashingMachineAdapter):
                 "the course on the washer, enable Remote Start and set "
                 "lg_thinq.start_preselected_program: true to let SmartWash start it"
             )
-        with self._lock:
+        with self._lock, _unexpected_payloads():
             state = self._read_state()
             if state.status in ACTIVE_STATUSES:
                 raise DeviceNotReady("A cycle is already running on the washer")
@@ -259,7 +261,7 @@ class LgThinqAdapter(WashingMachineAdapter):
         raise UnsupportedOperation("The LG ThinQ Connect API cannot resume a washer")
 
     def stop(self) -> None:
-        with self._lock:
+        with self._lock, _unexpected_payloads():
             self._operate("STOP")
 
     # ------------------------------------------------------------------- helpers
@@ -298,16 +300,29 @@ class LgThinqAdapter(WashingMachineAdapter):
             response = self._client.request(
                 method, f"{self._base}/{endpoint}", headers=headers, json=json
             )
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, RuntimeError) as exc:  # RuntimeError: client closed
             raise DeviceError(f"LG ThinQ request failed: {exc}") from exc
         try:
             payload = response.json()
         except ValueError:
+            if response.is_success:
+                raise DeviceError("LG ThinQ sent a response that is not JSON") from None
             payload = {}
         if response.is_success:
             return payload.get("response") if isinstance(payload, dict) else None
         error = (payload.get("error") if isinstance(payload, dict) else None) or {}
         raise _error(response.status_code, str(error.get("code", "")), error.get("message"))
+
+
+@contextmanager
+def _unexpected_payloads() -> Iterator[None]:
+    """Report malformed API responses as a DeviceError instead of crashing the caller."""
+    try:
+        yield
+    except DeviceError:
+        raise
+    except (KeyError, TypeError, ValueError, AttributeError, IndexError) as exc:
+        raise DeviceError(f"Unexpected response from LG ThinQ: {exc!r}") from exc
 
 
 def _error(status_code: int, code: str, message: str | None) -> DeviceError:

@@ -19,7 +19,8 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -103,6 +104,9 @@ class _Level:
     command: str
     parse: Callable[[str], int | None]
     unit: str
+    attribute: str
+    """Attribute holding the current value."""
+    name: str
 
 
 _TEMPERATURE_LEVEL = _Level(
@@ -112,10 +116,20 @@ _TEMPERATURE_LEVEL = _Level(
     "setWasherWaterTemperature",
     parse_temperature_label,
     "°C",
+    "washerWaterTemperature",
+    "water temperature",
 )
 _SPIN_LEVEL = _Level(
-    SPIN, "spinLevel", "supportedWasherSpinLevel", "setWasherSpinLevel", parse_spin_label, "rpm"
+    SPIN,
+    "spinLevel",
+    "supportedWasherSpinLevel",
+    "setWasherSpinLevel",
+    parse_spin_label,
+    "rpm",
+    "washerSpinLevel",
+    "spin speed",
 )
+SETTLE_POLL_S = 1.0
 
 
 class SmartThingsConfig(BaseModel):
@@ -127,6 +141,11 @@ class SmartThingsConfig(BaseModel):
     """Our programme (e.g. ``cotton``) -> cycle id (``Table_00_Course_5B``, or just ``5B``)."""
     start_preselected_program: bool = False
     """Start the cycle selected on the washer when a programme has no ``cycle_map`` entry."""
+    allow_unverified_levels: bool = False
+    """Start cycles whose temperature or spin SmartWash can neither set nor read, so the washer's
+    own value applies. Only enable this after checking those cycles against your care labels."""
+    settle_timeout_s: float = 8.0
+    """How long to wait for the washer to confirm temperature and spin before starting."""
     min_poll_interval_s: float = 10.0
     timeout_s: float = 20.0
 
@@ -184,11 +203,20 @@ class _Status:
 class SmartThingsAdapter(WashingMachineAdapter):
     name = "smartthings"
 
-    def __init__(self, config: SmartThingsConfig, *, client: httpx.Client | None = None) -> None:
+    def __init__(
+        self,
+        config: SmartThingsConfig,
+        *,
+        client: httpx.Client | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
         self.config = config
         self._base = config.base_url.rstrip("/")
         self._client = client or httpx.Client(timeout=config.timeout_s)
         self._owns_client = client is None
+        self._clock = clock
+        self._sleep = sleep
         self._lock = threading.RLock()
         self._device_id = config.device_id
         self._device: dict[str, Any] = {}
@@ -198,14 +226,17 @@ class SmartThingsAdapter(WashingMachineAdapter):
     @property
     def capabilities(self) -> AdapterCapabilities:
         mapped = bool(self.config.cycle_map)
+        status = self._last_status
+        levels = status is None or (status.has(TEMPERATURE) and status.has(SPIN))
         return AdapterCapabilities(
-            remote_start=mapped or self.config.start_preselected_program, select_program=mapped
+            remote_start=mapped or self.config.start_preselected_program,
+            select_program=mapped and levels,
         )
 
     # ----------------------------------------------------------------- lifecycle
 
     def connect(self) -> None:
-        with self._lock:
+        with self._lock, _unexpected_payloads():
             if self._device_id:
                 self._device = self._request("GET", f"/devices/{self._device_id}")
                 if not _is_washer(self._device):
@@ -228,7 +259,7 @@ class SmartThingsAdapter(WashingMachineAdapter):
         return {"adapter": self.name, **_describe_device(self._device, self._last_status)}
 
     def list_devices(self) -> list[dict[str, Any]]:
-        with self._lock:
+        with self._lock, _unexpected_payloads():
             washers = [d for d in self._devices() if _is_washer(d)]
             return [
                 _describe_device(d, self._status(d["deviceId"], remember=False)) for d in washers
@@ -237,8 +268,8 @@ class SmartThingsAdapter(WashingMachineAdapter):
     # --------------------------------------------------------------------- state
 
     def get_state(self) -> MachineState:
-        with self._lock:
-            now = time.monotonic()
+        with self._lock, _unexpected_payloads():
+            now = self._clock()
             if self._cached and now - self._cached[0] < self.config.min_poll_interval_s:
                 return self._cached[1]
             health = self._request("GET", f"/devices/{self._id()}/health")
@@ -252,7 +283,7 @@ class SmartThingsAdapter(WashingMachineAdapter):
     # ------------------------------------------------------------------ commands
 
     def start_cycle(self, settings: CycleSettings, *, load_kg: float | None = None) -> None:
-        with self._lock:
+        with self._lock, _unexpected_payloads():
             status = self._status()
             if status.get(REMOTE, "remoteControlEnabled") != "true":
                 raise DeviceNotReady(
@@ -283,19 +314,34 @@ class SmartThingsAdapter(WashingMachineAdapter):
                 commands.append((CYCLE, "setWasherCycle", [cycle_id]))
             options = cycles.get(_cycle_code(cycle_id)) if cycle_id else None
 
-            settings_commands = (
-                _level_command(status, options, _TEMPERATURE_LEVEL, settings.temperature_c),
-                _level_command(status, options, _SPIN_LEVEL, settings.spin_rpm),
-                _rinse_command(status, options) if settings.extra_rinse else None,
-            )
-            commands.extend(command for command in settings_commands if command is not None)
+            confirm: list[tuple[_Level, int]] = []
+            for level, requested in (
+                (_TEMPERATURE_LEVEL, settings.temperature_c),
+                (_SPIN_LEVEL, settings.spin_rpm),
+            ):
+                command = _level_command(
+                    status,
+                    options,
+                    level,
+                    requested,
+                    cycle_selected=mapped is not None,
+                    allow_unverified=self.config.allow_unverified_levels,
+                )
+                if command is not None:
+                    commands.append(command)
+                    confirm.append((level, requested))
+            if settings.extra_rinse and (rinse := _rinse_command(status, options)) is not None:
+                commands.append(rinse)
             if settings.prewash:
                 log.warning("SmartThings has no prewash option; ignoring it")
-            commands.append(_state_command(status, _START))
 
             for capability, command, arguments in commands:
                 self._execute(capability, command, arguments)
             self._cached = None
+            # Commands are only "ACCEPTED" and applied asynchronously (some models ignore them
+            # silently), so check the washer really took the levels before pressing start.
+            self._confirm_levels(confirm)
+            self._execute(*_state_command(status, _START))
             log.info("Started SmartThings cycle %s with %s", cycle_id, commands)
 
     def pause(self) -> None:
@@ -310,9 +356,34 @@ class SmartThingsAdapter(WashingMachineAdapter):
     # ------------------------------------------------------------------- helpers
 
     def _operate(self, command: tuple[str, str]) -> None:
-        with self._lock:
+        with self._lock, _unexpected_payloads():
             self._execute(*_state_command(self._status(), command))
             self._cached = None
+
+    def _confirm_levels(self, expected: list[tuple[_Level, int]]) -> None:
+        """Wait until the washer reports every level at or below the request, or refuse."""
+        if not expected:
+            return
+        deadline = self._clock() + self.config.settle_timeout_s
+        while True:
+            status = self._status()
+            pending = [
+                (level, requested)
+                for level, requested in expected
+                if not _reports_at_most(status, level, requested)
+            ]
+            if not pending:
+                return
+            if self._clock() >= deadline:
+                details = ", ".join(
+                    f"{level.name} (reports {status.get(level.capability, level.attribute)!r}, "
+                    f"needed at most {requested} {level.unit})"
+                    for level, requested in pending
+                )
+                raise DeviceError(
+                    f"The washer did not confirm its {details}; the cycle was not started"
+                )
+            self._sleep(SETTLE_POLL_S)
 
     def _mapped_cycle(self, program: Program) -> str | None:
         for candidate in program_candidates(program):
@@ -365,11 +436,17 @@ class SmartThingsAdapter(WashingMachineAdapter):
                 headers={"Authorization": f"Bearer {self.config.token}"},
                 json=json,
             )
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, RuntimeError) as exc:  # RuntimeError: client closed
             raise DeviceError(f"SmartThings request failed: {exc}") from exc
         if not response.is_success:
             raise _error(response)
-        return _json(response)
+        if not response.content:
+            return {}
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise DeviceError("SmartThings sent a response that is not JSON") from exc
+        return payload if isinstance(payload, dict) else {}
 
 
 def _is_washer(device: dict[str, Any]) -> bool:
@@ -470,28 +547,50 @@ def _cycle_code(cycle_id: str) -> str:
 
 
 def _level_command(
-    status: _Status, cycle_options: dict[str, Any] | None, level: _Level, requested: int
+    status: _Status,
+    cycle_options: dict[str, Any] | None,
+    level: _Level,
+    requested: int,
+    *,
+    cycle_selected: bool,
+    allow_unverified: bool = False,
 ) -> tuple[str, str, list[Any]] | None:
-    """Command setting ``level`` no higher than ``requested``; ``None`` if it cannot be set."""
-    if not status.has(level.capability):
-        log.warning("The washer cannot set %s remotely; its default applies", level.option)
-        return None
+    """Command setting ``level`` no higher than ``requested``.
+
+    ``None`` when the level cannot be chosen but the value the washer uses anyway is known to be
+    within the request: the cycle's default once SmartWash selects the cycle, otherwise the
+    current setting. Anything unknown is refused unless ``allow_unverified``.
+    """
     spec = (cycle_options or {}).get(level.option)
-    if spec is not None:
-        labels = list(spec.get("options") or [])
-    else:
-        labels = list(status.get(level.capability, level.supported) or [])
-    labels = [label for label in labels if label != "none"]
+    labels: list[str] = []
+    if status.has(level.capability):
+        if spec is not None:
+            labels = list(spec.get("options") or [])
+        else:
+            labels = list(status.get(level.capability, level.supported) or [])
+        labels = [label for label in labels if label != "none"]
     if not labels:
-        default = (spec or {}).get("default")
-        fixed = level.parse(default) if default else None
-        if fixed is not None and fixed > requested:
+        known = (
+            (spec or {}).get("default")
+            if cycle_selected
+            else status.get(level.capability, level.attribute)
+        )
+        fixed = level.parse(known) if isinstance(known, str) and known != "none" else None
+        if fixed is not None and fixed <= requested:
+            return None
+        if fixed is not None:
             raise UnsupportedOperation(
-                f"The selected cycle always uses {default} {level.unit}, "
+                f"The selected cycle always uses {known} {level.unit}, "
                 f"above the requested {requested}"
             )
-        log.warning("%s is fixed for this cycle; the washer's default applies", level.option)
-        return None
+        if allow_unverified:
+            log.warning("The washer's own %s applies; it cannot be checked", level.name)
+            return None
+        raise UnsupportedOperation(
+            f"SmartThings can neither set nor read the {level.name} of this cycle, so SmartWash "
+            f"cannot keep it at or below {requested} {level.unit}. Choose another cycle, or set "
+            "smartthings.allow_unverified_levels after checking this one."
+        )
     label = choose_at_most(requested, labels, level.parse)
     if label is None:
         raise UnsupportedOperation(
@@ -499,6 +598,23 @@ def _level_command(
             + ", ".join(labels)
         )
     return (level.capability, level.command, [label])
+
+
+def _reports_at_most(status: _Status, level: _Level, requested: int) -> bool:
+    value = status.get(level.capability, level.attribute)
+    parsed = level.parse(value) if isinstance(value, str) else None
+    return parsed is not None and parsed <= requested
+
+
+@contextmanager
+def _unexpected_payloads() -> Iterator[None]:
+    """Report malformed API responses as a DeviceError instead of crashing the caller."""
+    try:
+        yield
+    except DeviceError:
+        raise
+    except (KeyError, TypeError, ValueError, AttributeError, IndexError) as exc:
+        raise DeviceError(f"Unexpected response from SmartThings: {exc!r}") from exc
 
 
 def _rinse_command(

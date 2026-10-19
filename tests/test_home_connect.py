@@ -39,7 +39,10 @@ class FakeApi:
         if not queue:
             return httpx.Response(404, json={"error": {"key": "404", "description": "no route"}})
         item = queue.pop(0) if len(queue) > 1 else queue[0]
-        status, body = item(request) if callable(item) else item
+        result = item(request) if callable(item) else item
+        if isinstance(result, httpx.Response):
+            return result
+        status, body = result
         return httpx.Response(status) if body is None else httpx.Response(status, json=body)
 
     def sent(self, method: str, path: str) -> list[httpx.Request]:
@@ -122,10 +125,28 @@ def api():
 
 
 def make_adapter(api, **overrides):
-    config = HomeConnectConfig(**{"access_token": "token-1", "min_poll_interval_s": 0, **overrides})
-    adapter = HomeConnectAdapter(config, client=httpx.Client(transport=httpx.MockTransport(api)))
+    clock = overrides.pop("clock", None)
+    config = HomeConnectConfig(
+        **{
+            "access_token": "token-1",
+            "min_poll_interval_s": 0,
+            "idle_poll_interval_s": 0,
+            **overrides,
+        }
+    )
+    extra = {"clock": clock} if clock else {}
+    client = httpx.Client(transport=httpx.MockTransport(api))
+    adapter = HomeConnectAdapter(config, client=client, **extra)
     adapter.connect()
     return adapter
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
 
 
 def test_connect_picks_the_first_washer(api):
@@ -206,11 +227,105 @@ def test_disconnected_appliance_reports_offline(api):
     assert make_adapter(api).get_state().status is MachineStatus.OFFLINE
 
 
-def test_state_is_cached_to_respect_the_rate_limit(api):
-    adapter = make_adapter(api, min_poll_interval_s=60)
+def test_polling_is_slow_when_idle_and_fast_after_a_command(api):
+    clock = Clock()
+    adapter = make_adapter(api, min_poll_interval_s=60, idle_poll_interval_s=300, clock=clock)
+    reads = lambda: len(api.sent("GET", f"{BASE}/status"))  # noqa: E731
     adapter.get_state()
+    clock.now += 120
     adapter.get_state()
+    assert reads() == 1  # idle: cached for 5 minutes
+    clock.now += 181
+    adapter.get_state()
+    assert reads() == 2
+    api.on("DELETE", f"{BASE}/programs/active", (204, None))
+    adapter.stop()
+    adapter.get_state()
+    clock.now += 61
+    adapter.get_state()
+    assert reads() == 4  # just commanded: re-read at once, then every minute
+
+
+def test_failures_back_off_instead_of_hammering_the_api(api):
+    clock = Clock()
+    adapter = make_adapter(api, clock=clock)
+    reads = lambda: len(api.sent("GET", f"{BASE}/status"))  # noqa: E731
+    api.on("GET", f"{BASE}/status", (503, {"error": {"key": "unavailable"}}))
+    for _ in range(5):
+        with pytest.raises(DeviceError):
+            adapter.get_state()
+    assert reads() == 1
+    clock.now += 16
+    api.on("GET", f"{BASE}/status", (200, status_payload()))
+    assert adapter.get_state().status is MachineStatus.IDLE
+
+
+def test_rate_limit_honours_retry_after(api):
+    clock = Clock()
+    adapter = make_adapter(api, clock=clock)
+    too_many = {"error": {"key": "429", "description": "too many requests"}}
+    api.on(
+        "GET",
+        f"{BASE}/status",
+        lambda request: httpx.Response(429, headers={"Retry-After": "120"}, json=too_many),
+    )
+    with pytest.raises(DeviceError, match="too many"):
+        adapter.get_state()
+    clock.now += 100
+    with pytest.raises(DeviceError, match="retrying in 20 s"):
+        adapter.get_state()
     assert len(api.sent("GET", f"{BASE}/status")) == 1
+
+
+def test_rejected_refresh_token_is_not_retried_for_an_hour(api):
+    clock = Clock()
+    api.on("GET", f"{BASE}/status", (401, {"error": {"key": "invalid_token"}}))
+    api.on("POST", "/security/oauth/token", (400, {"error": "invalid_grant"}))
+    adapter = make_adapter(api, refresh_token="old", client_secret="secret", clock=clock)
+    for _ in range(3):
+        with pytest.raises(DeviceAuthError):
+            adapter.get_state()
+        clock.now += 301  # past the auth back-off, so the API is asked again
+    assert len(api.sent("POST", "/security/oauth/token")) == 1
+
+
+def test_token_cache_creates_its_directory_and_write_errors_are_not_fatal(api, tmp_path):
+    api.on("POST", "/security/oauth/token", (200, {"access_token": "t2", "refresh_token": "r2"}))
+    cache = tmp_path / "new" / "dir" / "tokens.json"
+    adapter = make_adapter(
+        api,
+        access_token=None,
+        refresh_token="r1",
+        client_secret="secret",
+        token_cache_path=str(cache),
+    )
+    assert json.loads(cache.read_text())["refresh_token"] == "r2"
+    blocked = tmp_path / "file"
+    blocked.write_text("not a directory")
+    adapter.config.token_cache_path = str(blocked / "tokens.json")
+    adapter._refresh()  # logs a warning instead of raising
+    assert adapter._access_token == "t2"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        lambda request: httpx.Response(200, text="<html>proxy login</html>"),
+        lambda request: httpx.Response(200, json={"unexpected": True}),
+    ],
+)
+def test_malformed_responses_are_device_errors(api, response):
+    adapter = make_adapter(api)
+    api.on("GET", f"{BASE}/status", response)
+    with pytest.raises(DeviceError):
+        adapter.get_state()
+
+
+def test_closed_client_is_a_device_error(api):
+    adapter = make_adapter(api)
+    adapter._client.close()
+    with pytest.raises(DeviceError, match="request failed"):
+        adapter.get_state()
 
 
 def test_start_sends_the_programme_with_options_capped_at_the_request(api):
@@ -267,15 +382,67 @@ def test_start_rounds_spin_down_and_falls_back_to_a_gentler_programme(api):
     assert body["data"]["options"][1]["value"] == S + "RPM800"
 
 
-def test_option_the_programme_lacks_is_left_to_the_machine(api):
+def test_programme_without_a_spin_setting_is_refused(api):
+    # The machine would spin at a speed SmartWash cannot see or cap.
     api.on("GET", f"{BASE}/programs/available", (200, available("Cotton")))
     api.on("GET", f"{BASE}/programs/available/{P}Cotton", (200, definition("Cotton", ["GC60"])))
+    with pytest.raises(UnsupportedOperation, match="no spin speed setting"):
+        make_adapter(api).start_cycle(
+            CycleSettings(program=Program.COTTON, temperature_c=60, spin_rpm=1400)
+        )
+    assert not api.sent("PUT", f"{BASE}/programs/active")
+
+
+def test_programme_without_a_temperature_setting_is_refused(api):
+    api.on("GET", f"{BASE}/programs/available", (200, available("Mix")))
+    api.on("GET", f"{BASE}/programs/available/{P}Mix", (200, definition("Mix", None, ["RPM800"])))
+    with pytest.raises(UnsupportedOperation, match="no temperature setting"):
+        make_adapter(api).start_cycle(
+            CycleSettings(program=Program.MIXED, temperature_c=30, spin_rpm=800)
+        )
+
+
+def test_eco_programme_keeps_its_own_temperature(api):
+    api.on("GET", f"{BASE}/programs/available", (200, available("Cotton.Eco4060")))
+    api.on(
+        "GET",
+        f"{BASE}/programs/available/{P}Cotton.Eco4060",
+        (200, definition("Cotton.Eco4060", None, ["RPM1000", "RPM1400"])),
+    )
     api.on("PUT", f"{BASE}/programs/active", (204, None))
     make_adapter(api).start_cycle(
-        CycleSettings(program=Program.COTTON, temperature_c=60, spin_rpm=1400)
+        CycleSettings(program=Program.ECO_40_60, temperature_c=40, spin_rpm=1400)
     )
     body = json.loads(api.sent("PUT", f"{BASE}/programs/active")[0].content)
-    assert [o["key"] for o in body["data"]["options"]] == ["LaundryCare.Washer.Option.Temperature"]
+    assert body["data"]["options"] == [
+        {"key": "LaundryCare.Washer.Option.SpinSpeed", "value": S + "RPM1400"}
+    ]
+
+
+def test_empty_programme_definition_sends_explicit_capped_values(api):
+    api.on("GET", f"{BASE}/programs/available", (200, available("Cotton")))
+    api.on("GET", f"{BASE}/programs/available/{P}Cotton", (200, definition("Cotton")))
+    api.on("PUT", f"{BASE}/programs/active", (204, None))
+    make_adapter(api).start_cycle(
+        CycleSettings(program=Program.COTTON, temperature_c=30, spin_rpm=800)
+    )
+    body = json.loads(api.sent("PUT", f"{BASE}/programs/active")[0].content)
+    assert [o["value"] for o in body["data"]["options"]] == [T + "GC30", S + "RPM800"]
+
+
+def test_bedding_never_escalates_to_the_harsher_cotton_programme(api):
+    api.on("GET", f"{BASE}/programs/available", (200, available("Cotton", "Mix")))
+    api.on(
+        "GET",
+        f"{BASE}/programs/available/{P}Mix",
+        (200, definition("Mix", ["GC40"], ["RPM1000"])),
+    )
+    api.on("PUT", f"{BASE}/programs/active", (204, None))
+    make_adapter(api).start_cycle(
+        CycleSettings(program=Program.BEDDING, temperature_c=40, spin_rpm=1000)
+    )
+    body = json.loads(api.sent("PUT", f"{BASE}/programs/active")[0].content)
+    assert body["data"]["key"] == P + "Mix"
 
 
 def test_missing_programme_without_substitute_is_unsupported(api):
@@ -306,7 +473,11 @@ def test_start_refuses_when_the_washer_is_not_ready(api, status, message):
 
 def test_conflict_from_the_api_is_not_ready_with_vendor_description(api):
     api.on("GET", f"{BASE}/programs/available", (200, available("Cotton")))
-    api.on("GET", f"{BASE}/programs/available/{P}Cotton", (200, definition("Cotton", ["GC40"])))
+    api.on(
+        "GET",
+        f"{BASE}/programs/available/{P}Cotton",
+        (200, definition("Cotton", ["GC40"], ["RPM1200"])),
+    )
     conflict = {"error": {"key": "SDK.Error.WrongOperationState", "description": "Wrong state"}}
     api.on("PUT", f"{BASE}/programs/active", (409, conflict))
     with pytest.raises(DeviceNotReady, match="Wrong state \\(SDK.Error.WrongOperationState\\)"):

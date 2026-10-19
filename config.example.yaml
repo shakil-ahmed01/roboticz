@@ -2,7 +2,7 @@
 #
 # Secrets: write ${ENV_VAR} (or ${ENV_VAR:-default}) and set the variable in your environment.
 # Only the block of the adapter you select is read, so the other examples can stay as they are.
-# Relative models.dir and data_dir paths are resolved against this file's directory.
+# Relative paths are resolved against this file's directory.
 
 machine:
   # simulator | mqtt | home_connect | smartthings | lg_thinq | home_assistant
@@ -29,7 +29,7 @@ machine:
     access_token: ${HOME_CONNECT_TOKEN}
     refresh_token: ${HOME_CONNECT_REFRESH_TOKEN:-}
     client_secret: ${HOME_CONNECT_CLIENT_SECRET:-}
-    # token_cache_path: /path/to/home_connect_tokens.json   # keeps refreshed tokens across restarts
+    token_cache_path: data/home_connect_tokens.json   # keeps refreshed tokens across restarts
     # ha_id: BOSCH-WAW28750GB-68A40E000000   # optional: `smartwash devices` lists yours
     # base_url: https://simulator.home-connect.com   # the developer portal's virtual washer
 
@@ -55,6 +55,7 @@ machine:
     url: http://homeassistant.local:8123
     token: ${HOME_ASSISTANT_TOKEN}
     status_entity: sensor.washer_operation_state
+    # allow_uncontrolled_levels: true   # only if HA cannot set temperature/spin and you do
     # remaining_entity: sensor.washer_remaining_program_time
     # power_entity: sensor.washer_plug_power
     # start: {service: button.press, data: {entity_id: button.washer_start}}
