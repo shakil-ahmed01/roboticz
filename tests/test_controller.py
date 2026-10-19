@@ -190,6 +190,63 @@ class CloudLikeAdapter(WashingMachineAdapter):
         self.status = MachineStatus.IDLE
 
 
+class LaggingAdapter(CloudLikeAdapter):
+    """Keeps reporting the previous state for a few reads after a start, like a slow cloud API."""
+
+    def __init__(self, lag_reads: int = 3, starts: bool = True) -> None:
+        super().__init__()
+        self.status = self.reported = MachineStatus.FINISHED  # the previous cycle's state
+        self.lag_reads = lag_reads
+        self.starts = starts
+        self._lag = 0
+
+    def get_state(self) -> MachineState:
+        if self._lag > 0:
+            self._lag -= 1
+        else:
+            self.reported = self.status
+        return MachineState(status=self.reported)
+
+    def start_cycle(self, settings, *, load_kg=None) -> None:
+        self.started.append(settings)
+        if self.starts:
+            self.status = MachineStatus.RUNNING
+        self._lag = self.lag_reads
+
+
+def test_stale_state_after_a_start_command_does_not_end_the_cycle(models, tmp_path, clock):
+    adapter = LaggingAdapter(lag_reads=3)
+    controller = make_controller(models, tmp_path, clock, adapter=adapter)
+    controller.start_cycle(StartCycleRequest(profile=COTTON))
+    for _ in range(4):
+        clock.now += 2
+        controller.poll()
+    assert controller.history.recent() == []
+    assert "cycle_stopped" not in events(controller)
+    assert controller.snapshot().cycle.source == "smartwash"
+    clock.now += 3600
+    controller.poll()
+    adapter.status = MachineStatus.FINISHED
+    controller.poll()
+    [cycle] = controller.history.recent()
+    assert (cycle.outcome, cycle.source, cycle.profile) == ("finished", "smartwash", COTTON)
+    assert events(controller).count("cycle_started") == 1
+
+
+def test_a_cycle_the_machine_never_starts_is_closed_after_the_grace_period(models, tmp_path, clock):
+    adapter = LaggingAdapter(lag_reads=0, starts=False)
+    controller = make_controller(models, tmp_path, clock, adapter=adapter)
+    controller.start_cycle(StartCycleRequest(profile=COTTON))
+    clock.now += 60
+    controller.poll()
+    assert controller.history.recent() == []
+    clock.now += 61
+    controller.poll()
+    [cycle] = controller.history.recent()
+    assert cycle.outcome == "stopped"
+    assert cycle.duration_min is None
+
+
 def test_without_telemetry_control_works_but_fault_detection_explains_why_not(
     models, tmp_path, clock
 ):

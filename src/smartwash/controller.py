@@ -45,6 +45,10 @@ log = logging.getLogger(__name__)
 
 MAX_SAMPLE_GAP_S = 15.0
 """Telemetry gaps longer than this (pauses, outages) are not counted as running time."""
+START_GRACE_S = 120.0
+"""Cloud APIs can report the old state for a while after a start command. Until the machine has
+reported the new cycle as running, an idle or finished state is not taken as its end for this long.
+"""
 
 
 class StartCycleRequest(BaseModel):
@@ -205,6 +209,7 @@ class WasherController:
         self._last_sample: TelemetrySample | None = None
         self._last_state: MachineState | None = None
         self._last_seen: float | None = None
+        self._seen_active = False
         self._latest: Diagnosis | None = None
         self._alerts: deque[Diagnosis] = deque(maxlen=50)
         self._windows_assessed = 0
@@ -468,14 +473,19 @@ class WasherController:
             )
         if self._cycle is not None:
             self._cycle.vendor_program = self._cycle.vendor_program or state.vendor_program
-            if state.status not in ACTIVE_STATUSES and state.status is not MachineStatus.OFFLINE:
-                if state.status is MachineStatus.FINISHED:
-                    outcome = "finished"
-                elif state.status is MachineStatus.ERROR:
-                    outcome = "error"
-                else:
-                    outcome = "finished" if self._was_nearly_done(previous) else "stopped"
-                self._end_cycle(outcome, state)
+            if state.status in ACTIVE_STATUSES:
+                self._seen_active = True
+            elif state.status is MachineStatus.ERROR:
+                self._end_cycle("error", state)
+            elif state.status is not MachineStatus.OFFLINE:
+                if self._seen_active:
+                    finished = state.status is MachineStatus.FINISHED or self._was_nearly_done(
+                        previous
+                    )
+                    self._end_cycle("finished" if finished else "stopped", state)
+                elif now - self._cycle.started_at >= START_GRACE_S:
+                    log.warning("The machine never reported the cycle as running.")
+                    self._end_cycle("stopped", state)
         if state.status is MachineStatus.ERROR and (
             previous is None or previous.status is not MachineStatus.ERROR
         ):
@@ -499,6 +509,7 @@ class WasherController:
         self._cycle = record
         self._running_s = self._telemetry_s = self._energy_j = 0.0
         self._has_power = False
+        self._seen_active = False
         self._last_sample = None
         self._windower.reset()
         self._debouncer.reset()
