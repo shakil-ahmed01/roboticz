@@ -55,7 +55,7 @@ class Notifier:
         assert self.webhook_url is not None
         try:
             self._client.post(self.webhook_url, json=payload).raise_for_status()
-        except httpx.HTTPError as exc:
+        except Exception as exc:  # a failed notification must never affect the machine
             log.warning("Webhook notification %r failed: %s", payload["event"], exc)
 
     def close(self) -> None:

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
+import threading
 import time
 
+import httpx
 import pytest
 
 from smartwash.ai.feedback import FeedbackStore
@@ -13,7 +16,12 @@ from smartwash.controller import (
     StartCycleRequest,
     WasherController,
 )
-from smartwash.devices import AdapterCapabilities, DeviceNotReady, UnsupportedOperation
+from smartwash.devices import (
+    AdapterCapabilities,
+    DeviceError,
+    DeviceNotReady,
+    UnsupportedOperation,
+)
 from smartwash.devices.base import WashingMachineAdapter
 from smartwash.devices.simulator import SimulatedWasherAdapter
 from smartwash.notifications import Notifier
@@ -303,3 +311,43 @@ def test_fault_injection_needs_the_simulator(models, tmp_path, clock):
     cloud = make_controller(models, tmp_path, clock, adapter=CloudLikeAdapter())
     with pytest.raises(UnsupportedOperation):
         cloud.inject_fault(FaultType.BEARING_WEAR)
+
+
+class FlakyAfterStartAdapter(CloudLikeAdapter):
+    def get_state(self) -> MachineState:
+        if self.started and not getattr(self, "_failed_once", False):
+            self._failed_once = True
+            raise DeviceError("cloud timeout")
+        return super().get_state()
+
+
+def test_a_failed_state_read_after_starting_still_reports_success(models, tmp_path, clock):
+    controller = make_controller(models, tmp_path, clock, adapter=FlakyAfterStartAdapter())
+    result = controller.start_cycle(StartCycleRequest(profile=COTTON))
+    assert result.state.status is MachineStatus.RUNNING
+    controller.poll()
+    assert controller.snapshot().cycle.source == "smartwash"
+
+
+def test_webhook_receives_the_configured_events():
+    received = []
+    delivered = threading.Event()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        received.append(json.loads(request.content))
+        delivered.set()
+        return httpx.Response(200)
+
+    notifier = Notifier(
+        "https://hooks.example/laundry",
+        events=["cycle_finished"],
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    notifier.notify("cycle_started", "Cycle started", "not sent")
+    notifier.notify("cycle_finished", "Laundry is done", "It took 120 min.", minutes=120)
+    assert delivered.wait(5)
+    assert [r["event"] for r in received] == ["cycle_finished"]
+    assert received[0]["text"] == "Laundry is done: It took 120 min."
+    assert received[0]["data"] == {"minutes": 120}
+    assert [e["event"] for e in notifier.recent] == ["cycle_started", "cycle_finished"]
+    notifier.close()

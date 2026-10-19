@@ -283,7 +283,12 @@ class WasherController:
                     started_at=self._clock(), settings=settings, profile=profile, estimate=estimate
                 )
             )
-            state = self._refresh_state()
+            try:
+                state = self._refresh_state()
+            except DeviceError as exc:
+                # The machine accepted the start; don't report failure (and invite a retry).
+                log.warning("Cycle started, but reading the machine's state failed: %s", exc)
+                state = MachineState(status=MachineStatus.RUNNING, program=settings.program)
         chose_own = profile is not None and recommendation is None
         if chose_own and settings != self.recommend(profile).settings:
             # Remember the household's preference; it personalises the next retraining.
