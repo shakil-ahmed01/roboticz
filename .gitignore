@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+
+# Trained model artefacts and runtime data (re-created by `smartwash train`)
+models/
+data/
+
+# Local configuration (may contain tokens)
+config.yaml
+.env

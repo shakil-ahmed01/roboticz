@@ -1,0 +1,82 @@
+# SmartWash configuration. Copy to config.yaml (git-ignored) and adjust.
+#
+# Secrets: write ${ENV_VAR} (or ${ENV_VAR:-default}) and set the variable in your environment.
+# Only the block of the adapter you select is read, so the other examples can stay as they are.
+# Relative models.dir and data_dir paths are resolved against this file's directory.
+
+machine:
+  # simulator | mqtt | home_connect | smartthings | lg_thinq | home_assistant
+  adapter: simulator
+  capacity_kg: 8              # your drum's rated capacity
+
+  # A virtual washer: try everything without hardware.
+  simulator:
+    time_scale: 60            # 1 real second = 1 machine minute; use 1 for real time
+    fault: none               # e.g. drain_blockage, to watch the AI catch it
+    fault_severity: 1.0       # 0.3 = early stage ... 1.4 = severe
+
+  # DIY / ESP32 / custom machines, or anything bridged to MQTT. See docs/mqtt-protocol.md.
+  mqtt:
+    host: localhost
+    port: 1883
+    base_topic: smartwash/washer
+    username: ${MQTT_USERNAME:-}
+    password: ${MQTT_PASSWORD:-}
+    # tls: true
+
+  # Bosch, Siemens, Neff, Gaggenau, Thermador. See docs/cloud-adapters.md.
+  home_connect:
+    access_token: ${HOME_CONNECT_TOKEN}
+    refresh_token: ${HOME_CONNECT_REFRESH_TOKEN:-}
+    client_secret: ${HOME_CONNECT_CLIENT_SECRET:-}
+    # token_cache_path: /path/to/home_connect_tokens.json   # keeps refreshed tokens across restarts
+    # ha_id: BOSCH-WAW28750GB-68A40E000000   # optional: `smartwash devices` lists yours
+    # base_url: https://simulator.home-connect.com   # the developer portal's virtual washer
+
+  # Samsung. Cycle ids are model-specific: `smartwash devices` lists the ones your washer has.
+  smartthings:
+    token: ${SMARTTHINGS_TOKEN}
+    # device_id: 0a1b2c3d-...
+    cycle_map:
+      cotton: Table_00_Course_5B
+      # synthetics: Table_00_Course_5C
+      # wool: Table_00_Course_6A
+
+  # LG, via the official ThinQ Connect API. It cannot choose the programme remotely: set it on
+  # the machine and allow SmartWash to start whatever is selected.
+  lg_thinq:
+    access_token: ${LG_THINQ_TOKEN}
+    country: GB
+    start_preselected_program: false
+
+  # Any brand Home Assistant integrates (LG, Miele, Electrolux, Whirlpool, GE, ...).
+  # Full examples in docs/cloud-adapters.md.
+  home_assistant:
+    url: http://homeassistant.local:8123
+    token: ${HOME_ASSISTANT_TOKEN}
+    status_entity: sensor.washer_operation_state
+    # remaining_entity: sensor.washer_remaining_program_time
+    # power_entity: sensor.washer_plug_power
+    # start: {service: button.press, data: {entity_id: button.washer_start}}
+
+models:
+  dir: models                 # trained models and the learned cycle calibration
+  auto_train: true            # train on first start if no models exist (about 30 s)
+
+monitoring:
+  enabled: true
+  interval_s: 2
+  consecutive_windows: 2      # one-minute windows that must agree before a fault is reported
+  min_confidence: 0.6
+  auto_pause_on_critical: true   # pause on a blocked drain or motor overload
+
+notifications:
+  # Receives a JSON POST for every event: Home Assistant webhooks, Slack, n8n, ...
+  webhook_url: ${SMARTWASH_WEBHOOK_URL:-}
+
+api:
+  host: 127.0.0.1             # keep local unless you set an API key
+  port: 8000
+  api_key: ${SMARTWASH_API_KEY:-}
+
+data_dir: data                # feedback and cycle history
